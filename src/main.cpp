@@ -5,6 +5,7 @@
   pinout.
   Note that this has been adapter to update via WIFI OTA
 */
+#include "secrets.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <Arduino.h>
@@ -17,17 +18,6 @@
 #include <SPI.h>
 #include <WiFi.h>
 
-// WiFi credentials
-#define WIFI_SSID "STARLINK_24GHz"
-#define WIFI_PASSWORD ""  // Replace with actual password
-
-// InfluxDB settings
-#define INFLUXDB_URL "https://us-east-1-1.aws.cloud2.influxdata.com"
-#define INFLUXDB_TOKEN                                                   \
-  "1fkHBo_LQvxuoW9cWJmzeqnw9p0C-gfHole7ZyxGfPbM8og-FqpAjcf4kuoGnI_" \
-  "fp5t5YYYheKeeSHoEc_xbkg=="
-#define INFLUXDB_ORG "53ddd0e07447bab8"
-#define INFLUXDB_BUCKET "power"
 
 // Time zone info
 #define TZ_INFO "AWST-8"
