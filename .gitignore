@@ -13,6 +13,6 @@ libdeps/
 *.pio
 build/
 .DS_Store
-
+*test
 # Local config, secrets
 secrets.h
