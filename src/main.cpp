@@ -6,21 +6,21 @@
   Note that this has been adapter to update via WIFI OTA
 */
 #include "secrets.h"
-#include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <ESPmDNS.h>
-// #include <Fonts/FreeSans9pt7b.h>  // Include font with degrees symbol
 #include <Fonts/TomThumb.h>
 #include <InfluxDbClient.h>
 #include <InfluxDbCloud.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <time.h>
 
 
 // Time zone info
 #define TZ_INFO "AWST-8"
+#define DEVICE "HomeDisplay"
 
 // InfluxDB client instance
 InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET,
@@ -41,6 +41,29 @@ InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET,
 // #define TFT_DC 8    // Data/Command2
 // #define TFT_CS 7    // Chip Select3
 // #define TFT_BL 5    // Backlight10
+
+// TFT display instance
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+
+// Add this helper function
+bool isQuietHours() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false; // if time unavailable, stay on
+
+  int hour = timeinfo.tm_hour; // 0–23 in AWST
+  return (hour >= 22 || hour < 6); // 10pm to 4am
+}
+
+// Add this helper to blank/restore the display
+void setDisplaySleep(bool sleep) {
+  if (sleep) {
+    digitalWrite(TFT_BL, LOW);   // backlight off
+    tft.enableDisplay(false);    // display off
+  } else {
+    tft.enableDisplay(true);
+    digitalWrite(TFT_BL, HIGH);
+  }
+}
 
 // Helper: pulse display reset and run a quick self-test
 void pulseDisplayReset() {
@@ -63,15 +86,12 @@ void pulseDisplayReset() {
 
 // LED pin
 // #define LED_PIN 8  // Onboard blue LED
-bool ledState = LOW;
+// bool ledState = LOW;
 bool eraseDisplay = false;
-unsigned long VoidMillis;
 unsigned long previousMillis = 0;  // for LED timing
 int step = 0;  // keeps track of which part of the sequence we're in
 bool otaInProgress = false;
 
-// TFT display instance
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 // Time interval for querying (30 seconds)
 #define QUERY_INTERVAL 5000
@@ -80,6 +100,53 @@ float soc = NAN, voltage = NAN, powerIn = NAN, powerOut = NAN,
       ambientTemp = NAN, ChargeRate = NAN;
 int DesignVoltage = 24;
 String Message = "";
+
+// Check if time is synchronized
+bool isTimeSynchronized() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  return (timeinfo->tm_year + 1900) > 2020;
+}
+
+void logToInfluxDB(String message, String level) {
+  Serial.println("Logging: " + message);
+
+  Point logPoint("ErrorLogs");
+  logPoint.addTag("device", DEVICE);
+  logPoint.addTag("level", level);
+  logPoint.addField("Message", message);
+  if (isTimeSynchronized()) {
+    time_t now = time(nullptr);
+    logPoint.setTime(now * 1000000000LL);  // Nanosecond precision
+  } else {
+    Serial.println("Time not synchronized, skipping timestamp for log point");
+  }
+  // Safely add WiFi info only if connected
+  if (WiFi.status() == WL_CONNECTED) {
+    char ipStr[16];
+    snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", WiFi.localIP()[0],
+             WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+    logPoint.addField("IP", ipStr);
+    logPoint.addField("MAC", WiFi.macAddress());
+    logPoint.addField("RSSI", WiFi.RSSI());
+  } else {
+    logPoint.addField("IP", "Not connected");
+    logPoint.addField("MAC",
+                      WiFi.macAddress());  // MAC is safe even when disconnected
+    logPoint.addField("RSSI", 0);
+  }
+  logPoint.addField("FreeHeap", ESP.getFreeHeap());
+  logPoint.addField("UptimeMillis", millis());
+
+  Serial.println("Writing log point to InfluxDB...");
+  if (!client.writePoint(logPoint)) {
+    Serial.print("InfluxDB log write failed: ");
+    Serial.println(client.getLastErrorMessage());
+  } else {
+    Serial.println("Log point written successfully");
+  }
+}
+
 
 void setup() {
   // pinMode(LED_PIN, OUTPUT);
@@ -99,12 +166,6 @@ void setup() {
 // quick visual self-test: turn backlight on, show a few colours then clear
   digitalWrite(TFT_BL, HIGH);  // Backlight on
   tft.setRotation(2);          // Adjust rotation (0-3) as needed
-  tft.fillScreen(ST77XX_RED);
-  delay(60);
-  tft.fillScreen(ST77XX_GREEN);
-  delay(60);
-  tft.fillScreen(ST77XX_BLUE);
-  delay(60);
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
   tft.setTextSize(2);
@@ -114,39 +175,12 @@ void setup() {
   // Connect to WiFi
   Serial.println("Connecting to WiFi...");
   tft.println("Connecting WiFi...");
-  WiFi.setHostname("HomeDisplay");  // Set before or after connect
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  // Set device hostname for OTA and mDNS
+  WiFi.mode(WIFI_STA);  // this is necessary on supermini to allow OTA discovery by hostname
   WiFi.setHostname("HomeDisplay");
   ArduinoOTA.setHostname("HomeDisplay");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // OTA event handlers (optional, for debug)
-  ArduinoOTA.onStart([]() { Serial.println("OTA Update Start"); });
-  ArduinoOTA.onEnd([]() { Serial.println("OTA Update End"); });
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
-  });
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR)
-      Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR)
-      Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR)
-      Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR)
-      Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR)
-      Serial.println("End Failed");
-  });
-
-  // Start mDNS responder
-  if (!MDNS.begin("HomeDisplay")) {
-    Serial.println("Error starting mDNS responder!");
-  } else {
-    Serial.println("mDNS responder started as HomeDisplay.local");
-  }
+  configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com");
 
   unsigned long startTime = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
@@ -161,8 +195,23 @@ void setup() {
     tft.println("\nWiFi OK");
     tft.print("IP: ");
     tft.println(WiFi.localIP());
-    // Start OTA now that WiFi is connected
-    ArduinoOTA.begin();
+    MDNS.begin("HomeDisplay");  // This is what enables OTA discovery by hostname
+    if (MDNS.begin("HomeDisplay")) {
+      Serial.println("mDNS responder started");
+      logToInfluxDB("mDNS responder started", "INFO");
+      MDNS.addService("arduino", "tcp", 3232);
+      MDNS.addService("http", "tcp", 80);
+
+    } else {
+      Serial.println("Error starting mDNS");
+      logToInfluxDB("Error starting mDNS", "WARNING");
+    }
+    // Configure DNS servers immediately after WiFi connects
+    IPAddress dnsServer1(8, 8, 8, 8);  // Google DNS primary
+    IPAddress dnsServer2(8, 8, 4, 4);  // Google DNS secondary
+    WiFi.setDNS(dnsServer1, dnsServer2);
+    Serial.println("DNS servers configured: 8.8.8.8 (primary), 8.8.4.4 (secondary)");
+
     ArduinoOTA.onStart([]() {
       Serial.println("OTA Update Start");
       otaInProgress = true;  // Set flag to pause readings
@@ -171,6 +220,9 @@ void setup() {
       Serial.println("OTA Update End");
       otaInProgress = false;  // Resume readings
     });
+    // Start OTA now that WiFi is connected
+    // ArduinoOTA.setPort(3232);  // explicitly set, don't rely on default
+    ArduinoOTA.begin();
   } else {
     Serial.println("\nWiFi connection failed");
     tft.println("\nWiFi Failed");
@@ -190,7 +242,6 @@ void setup() {
     tft.println(client.getLastErrorMessage());
   }
 
-  VoidMillis = millis();
   delay(1000);  // Show init messages
   tft.setTextSize(3);
   tft.fillScreen(ST77XX_BLACK);
@@ -200,6 +251,19 @@ void loop() {
   ArduinoOTA.handle();  // Handle OTA updates
   if (otaInProgress) {
     return;
+  }
+
+  if (isQuietHours()) {
+    setDisplaySleep(true);
+    delay(5000); // check again in 60s — no point hammering the CPU
+    return;       // skip the rest of loop()
+  }
+
+  setDisplaySleep(false);
+
+  if (eraseDisplay == true) {
+    tft.fillScreen(ST77XX_BLACK);
+    eraseDisplay = false;
   }
 
   String query = "from(bucket:\"" + String(INFLUXDB_BUCKET) +
@@ -212,10 +276,6 @@ void loop() {
                  "exists r._value)"
                  " |> last()";
   FluxQueryResult result = client.query(query);
-  if (eraseDisplay == true) {
-    tft.fillScreen(ST77XX_BLACK);
-    eraseDisplay = false;
-  }
 
   // Query InfluxDB
   tft.setCursor(0, 0);
